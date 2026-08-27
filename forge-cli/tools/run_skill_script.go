@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -90,6 +92,12 @@ func (t *RunSkillScriptTool) Execute(ctx context.Context, args json.RawMessage) 
 		}
 		jsonArgs = string(input.Args)
 	}
+	// Indented JSON for argv: compact JSON (no space after ':') gets
+	// truncated by Git-Bash/MSYS's re-parsing of the Windows command line.
+	argvJSON := jsonArgs
+	if indented, err := json.MarshalIndent(json.RawMessage(jsonArgs), "", " "); err == nil {
+		argvJSON = string(indented)
+	}
 
 	dir, ok := builtins.SkillDir(t.workDir, input.Skill)
 	if !ok {
@@ -111,6 +119,8 @@ func (t *RunSkillScriptTool) Execute(ctx context.Context, args json.RawMessage) 
 	// CWD = the skill dir so `input.Path` (relative) and the script's own
 	// relative references resolve there. Same subprocess posture as
 	// cli_execute / skill scripts (egress proxy + env passthrough).
+	// argvJSON goes to argv[1]; jsonArgs (compact) also goes on stdin for
+	// scripts that read from there instead.
 	exec := &SkillCommandExecutor{
 		Timeout:  t.timeout,
 		WorkDir:  dir,
@@ -118,7 +128,7 @@ func (t *RunSkillScriptTool) Execute(ctx context.Context, args json.RawMessage) 
 		ProxyURL: t.proxyURL,
 		SOCKSURL: t.socksURL,
 	}
-	out, runErr := exec.Run(ctx, interp, []string{input.Path, jsonArgs}, nil)
+	out, runErr := exec.Run(ctx, interp, []string{input.Path, argvJSON}, []byte(jsonArgs))
 	if runErr != nil {
 		// Build via json.Marshal, not fmt %q: script output can carry raw
 		// bytes / invalid UTF-8 that %q would emit as \xNN escapes, which
@@ -148,14 +158,53 @@ func jsonError(msg string) string { return jsonObj(map[string]any{"error": msg})
 func interpreterForScript(path string) (string, error) {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".sh", ".bash":
-		return "bash", nil
+		return bashInterpreter(), nil
 	case ".py":
-		return "python3", nil
+		return pythonInterpreter(), nil
 	case ".js", ".cjs", ".mjs":
 		return "node", nil
 	default:
 		return "", fmt.Errorf("unsupported script type %q (supported: .sh, .py, .js)", filepath.Ext(path))
 	}
+}
+
+// bashInterpreter prefers Git for Windows' native bash.exe over a bare
+// "bash" lookup, which can land on the WSL launcher stub — its extra
+// Windows<->Linux argv translation corrupts arguments with embedded quotes.
+func bashInterpreter() string {
+	if runtime.GOOS != "windows" {
+		return "bash"
+	}
+	candidates := []string{
+		`C:\Program Files\Git\bin\bash.exe`,
+		`C:\Program Files\Git\usr\bin\bash.exe`,
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return "bash"
+}
+
+// pythonInterpreter resolves python3 on Windows, skipping the WindowsApps
+// execution-alias stub (prints an install prompt, exits nonzero) that
+// LookPath alone can't distinguish from a real interpreter.
+func pythonInterpreter() string {
+	if runtime.GOOS != "windows" {
+		return "python3"
+	}
+	for _, c := range []string{"python3", "python"} {
+		path, err := exec.LookPath(c)
+		if err != nil {
+			continue
+		}
+		cmd := exec.Command(path, "--version")
+		if err := cmd.Run(); err == nil {
+			return path
+		}
+	}
+	return "python3"
 }
 
 func truncate(s string, max int) string {
